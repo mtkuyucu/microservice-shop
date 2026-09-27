@@ -1,0 +1,137 @@
+name: GitOps CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: npm
+          cache-dependency-path: product-service/package-lock.json
+
+      - name: Run tests
+        working-directory: product-service
+        run: |
+          npm ci
+          npm test
+          npm run lint
+
+      - name: Generate build metadata
+        id: meta
+        shell: bash
+        run: |
+          SHA="${GITHUB_SHA::8}"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            echo "environment=production" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_REF" == refs/heads/develop ]]; then
+            echo "environment=staging" >> "$GITHUB_OUTPUT"
+          else
+            echo "environment=none" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate Docker tags
+        id: docker-meta
+        if: github.event_name != 'pull_request'
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          IMAGE_SHA: ${{ steps.meta.outputs.sha }}
+          IMAGE_VERSION: ${{ steps.meta.outputs.version }}
+          IS_RELEASE: ${{ steps.meta.outputs.is_release }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          {
+            echo 'tags<<EOF'
+            echo "${DOCKER_USERNAME}/product-service:${IMAGE_SHA}"
+            if [[ "$IS_RELEASE" == "true" ]]; then
+              echo "${DOCKER_USERNAME}/product-service:${IMAGE_VERSION}"
+            fi
+            if [[ "$GITHUB_REF_NAME" == "main" ]]; then
+              echo "${DOCKER_USERNAME}/product-service:latest"
+            elif [[ "$GITHUB_REF_NAME" == "develop" ]]; then
+              echo "${DOCKER_USERNAME}/product-service:develop"
+            fi
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Build Docker image for pull request
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./product-service
+          push: false
+          tags: product-service:pull-request
+
+      - name: Build and push Docker image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./product-service
+          push: true
+          tags: ${{ steps.docker-meta.outputs.tags }}
+
+      - name: Update GitOps configuration
+        if: github.event_name != 'pull_request' && steps.meta.outputs.environment != 'none'
+        env:
+          GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          SERVICE_SHA: ${{ steps.meta.outputs.sha }}
+          DEPLOY_ENVIRONMENT: ${{ steps.meta.outputs.environment }}
+        shell: bash
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+          git clone "https://x-access-token:${GITHUB_PAT}@github.com/${REPOSITORY_OWNER}/k8s-config.git"
+          cd k8s-config
+
+          ENV_PATH="environments/${DEPLOY_ENVIRONMENT}"
+          mkdir -p "${ENV_PATH}"
+          echo "product-service:${SERVICE_SHA}" > "${ENV_PATH}/product-service.version"
+
+          git add "${ENV_PATH}/product-service.version"
+          if git diff --cached --quiet; then
+            echo "GitOps configuration is already up to date."
+          else
+            git commit -m "Update product-service to ${SERVICE_SHA} in ${DEPLOY_ENVIRONMENT}"
+            git push
+          fi
