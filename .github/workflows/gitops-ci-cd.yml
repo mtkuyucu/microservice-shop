@@ -112,7 +112,7 @@ jobs:
       - name: Update GitOps configuration
         if: github.event_name != 'pull_request' && steps.meta.outputs.environment != 'none'
         env:
-          GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
+          GIT_PAT: ${{ secrets.GIT_PAT }}
           REPOSITORY_OWNER: ${{ github.repository_owner }}
           SERVICE_SHA: ${{ steps.meta.outputs.sha }}
           DEPLOY_ENVIRONMENT: ${{ steps.meta.outputs.environment }}
@@ -121,7 +121,7 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git config --global user.name "github-actions[bot]"
 
-          git clone "https://x-access-token:${GITHUB_PAT}@github.com/${REPOSITORY_OWNER}/k8s-config.git"
+          git clone "https://x-access-token:${GIT_PAT}@github.com/${REPOSITORY_OWNER}/k8s-config.git"
           cd k8s-config
 
           ENV_PATH="environments/${DEPLOY_ENVIRONMENT}"
